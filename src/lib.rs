@@ -1,4 +1,5 @@
-//! Convert an [`io::Write`] to a [`libc::FILE`], useful for FFI.
+//! Convert an [`io::Write`] to a [`libc::FILE`] using the [`fopencookie`](https://man7.org/linux/man-pages/man3/fopencookie.3.html) syscall.
+//! Useful for FFI.
 //!
 //! ```
 //! # use fopencookie::Mode;
@@ -38,8 +39,9 @@
 use core::fmt;
 use std::{
     ffi::CStr,
+    fmt::Write,
     io::{self, SeekFrom},
-    marker::PhantomData,
+    num::TryFromIntError,
     ptr::NonNull,
     slice,
     str::FromStr,
@@ -48,17 +50,117 @@ use std::{
 use fopencookie_sys as sys;
 use libc::{c_char, c_int, c_long, c_void, off_t, size_t};
 
+type ReadFnPtr<T = ()> = fn(&mut T, &mut [u8]) -> io::Result<usize>;
+type WriteFnPtr<T = ()> = fn(&mut T, &[u8]) -> io::Result<usize>;
+type FlushFnPtr<T = ()> = fn(&mut T) -> io::Result<()>;
+type SeekFnPtr<T = ()> = fn(&mut T, SeekFrom) -> io::Result<u64>;
+
 #[derive(Clone, Copy)]
-struct VTable {
-    read: sys::cookie_read_function_t,
-    write: sys::cookie_write_function_t,
-    seek: sys::cookie_seek_function_t,
-    flush: sys::cookie_close_function_t,
-    drop: sys::cookie_close_function_t,
+struct VTable<T> {
+    read: Action<ReadFnPtr<T>>,
+    write: Action<WriteFnPtr<T>>,
+    flush: Option<FlushFnPtr<T>>,
+    seek: Option<SeekFnPtr<T>>,
 }
 
-#[cfg(not(doctest))]
-impl VTable {
+#[derive(Clone, Copy)]
+enum Action<T> {
+    Do(T),
+    Ignore,
+    Unsupported,
+}
+
+/// Builder for a call to [`fopencookie`](https://man7.org/linux/man-pages/man3/fopencookie.3.html).
+///
+/// See [module documentation](mod@self) for more.
+#[must_use = "Call `build` to actually create the file handle"]
+pub struct Builder<T> {
+    vtable: VTable<T>,
+    leak: Option<Leak>,
+}
+
+impl<T> Builder<T> {
+    /// Start the builder.
+    pub const fn new() -> Self {
+        Self {
+            vtable: VTable {
+                read: Action::Ignore,
+                write: Action::Ignore,
+                flush: None,
+                seek: None,
+            },
+            leak: None,
+        }
+    }
+    pub const fn read(mut self) -> Self
+    where
+        T: io::Read,
+    {
+        self.vtable.read = Action::Do(T::read);
+        self
+    }
+    pub const fn write(mut self) -> Self
+    where
+        T: io::Write,
+    {
+        self.vtable.write = Action::Do(T::write);
+        self
+    }
+    pub const fn seek(mut self) -> Self
+    where
+        T: io::Seek,
+    {
+        self.vtable.seek = Some(T::seek);
+        self
+    }
+    pub const fn strict(mut self) -> Self {
+        if matches!(self.vtable.read, Action::Ignore) {
+            self.vtable.read = Action::Unsupported
+        }
+        if matches!(self.vtable.write, Action::Ignore) {
+            self.vtable.write = Action::Unsupported
+        }
+        self
+    }
+    pub const fn leak(mut self, leak: Leak) -> Self {
+        self.leak = Some(leak);
+        self
+    }
+    pub fn build(self, mode: Mode, inner: T) -> io::Result<NonNull<libc::FILE>> {
+        let Self { vtable, leak } = self;
+        let cookie = Box::into_raw(Box::new(Cookie { vtable, inner }));
+        let file = unsafe {
+            sys::fopencookie(
+                cookie.cast::<c_void>(),
+                mode.as_cstr().as_ptr(),
+                sys::cookie_io_functions_t {
+                    read: Some(Cookie::<T>::read),
+                    write: Some(Cookie::<T>::write),
+                    seek: Some(Cookie::<T>::seek),
+                    close: Some(match leak {
+                        Some(Leak::Always) => Cookie::<T>::maybe_flush_do_not_drop,
+                        Some(Leak::IfPanicking) => Cookie::<T>::maybe_flush_drop_if_not_panicking,
+                        None => Cookie::<T>::maybe_flush_always_drop,
+                    }),
+                },
+            )
+        };
+        match NonNull::new(file.cast::<libc::FILE>()) {
+            Some(it) => Ok(it),
+            None => {
+                drop(unsafe { Box::from_raw(cookie) });
+                Err(io::Error::last_os_error())
+            }
+        }
+    }
+}
+
+struct Cookie<T> {
+    vtable: VTable<T>,
+    inner: T,
+}
+
+impl<T> Cookie<T> {
     /**
     This function implements read operations for the stream.
     When called, it receives three arguments:
@@ -75,19 +177,22 @@ impl VTable {
     If *read is a null pointer, then reads from the custom
     stream always return end of file.
     */
-    unsafe extern "C" fn read<T: ?Sized + io::Read>(
-        cookie: *mut c_void,
-        buf: *mut c_char,
-        len: size_t,
-    ) -> c_long {
-        let reader: &mut Cookie<T> = &mut *cookie.cast::<Cookie<T>>();
-        let buf = slice::from_raw_parts_mut(buf.cast::<u8>(), len);
-        reader
-            .io
-            .read(buf)
+    unsafe extern "C" fn read(cookie: *mut c_void, buf: *mut c_char, len: size_t) -> c_long {
+        let cookie = &mut *cookie.cast::<Cookie<T>>();
+        match cookie.vtable.read {
+            Action::Do(f) => f(
+                &mut cookie.inner,
+                slice::from_raw_parts_mut(buf.cast::<u8>(), len),
+            )
             .map_err(setting_errno)
-            .and_then(|n| n.try_into().map_err(|_| set_errno(libc::EOVERFLOW)))
-            .unwrap_or(-1)
+            .and_then(|n| n.try_into().map_err(setting_errno))
+            .unwrap_or(-1),
+            Action::Unsupported => {
+                set_errno(libc::ENOTSUP);
+                -1
+            }
+            Action::Ignore => 0,
+        }
     }
     /**
     This function implements write operations for the stream.
@@ -106,19 +211,22 @@ impl VTable {
     If *write is a null pointer, then output to the stream is
     discarded.
      */
-    unsafe extern "C" fn write<T: ?Sized + io::Write>(
-        cookie: *mut c_void,
-        buf: *const c_char,
-        len: size_t,
-    ) -> c_long {
-        let writer: &mut Cookie<T> = &mut *cookie.cast::<Cookie<T>>();
-        let buf = slice::from_raw_parts(buf.cast::<u8>(), len);
-        writer
-            .io
-            .write(buf)
+    unsafe extern "C" fn write(cookie: *mut c_void, buf: *const c_char, len: size_t) -> c_long {
+        let cookie = &mut *cookie.cast::<Cookie<T>>();
+        match cookie.vtable.write {
+            Action::Do(f) => f(
+                &mut cookie.inner,
+                slice::from_raw_parts(buf.cast::<u8>(), len),
+            )
             .map_err(setting_errno)
-            .and_then(|n| n.try_into().map_err(|_| set_errno(libc::EOVERFLOW)))
-            .unwrap_or_default()
+            .and_then(|n| n.try_into().map_err(setting_errno))
+            .unwrap_or(0),
+            Action::Unsupported => {
+                set_errno(libc::ENOTSUP);
+                0
+            }
+            Action::Ignore => len.try_into().unwrap_or(c_long::MAX),
+        }
     }
     /**
     This function closes the stream.  The hook function can do
@@ -136,20 +244,35 @@ impl VTable {
     If *close is NULL, then no special action is performed
     when the stream is closed.
      */
-    unsafe extern "C" fn drop<T: ?Sized>(cookie: *mut c_void) -> c_int {
+    #[allow(unused)] // useful for the docs
+    unsafe extern "C" fn close(cookie: *mut c_void) -> c_int {
+        Self::maybe_flush_always_drop(cookie)
+    }
+    unsafe extern "C" fn maybe_flush_always_drop(cookie: *mut c_void) -> c_int {
+        let ret = Self::maybe_flush_do_not_drop(cookie);
         drop(Box::from_raw(cookie.cast::<Cookie<T>>()));
-        0
+        ret
     }
-    /// See [`Self::drop`]
-    unsafe extern "C" fn flush<T: ?Sized + io::Write>(cookie: *mut c_void) -> c_int {
-        let writer: &mut Cookie<T> = &mut *cookie.cast::<Cookie<T>>();
-        writer
-            .io
-            .flush()
-            .map(|_| 0)
-            .map_err(setting_errno)
-            .unwrap_or(libc::EOF)
+    unsafe extern "C" fn maybe_flush_drop_if_not_panicking(cookie: *mut c_void) -> c_int {
+        if !std::thread::panicking() {
+            let ret = Self::maybe_flush_do_not_drop(cookie);
+            drop(Box::from_raw(cookie.cast::<Cookie<T>>()));
+            ret
+        } else {
+            0
+        }
     }
+    unsafe extern "C" fn maybe_flush_do_not_drop(cookie: *mut c_void) -> c_int {
+        let cookie = &mut *cookie.cast::<Cookie<T>>();
+        match cookie.vtable.flush {
+            Some(f) => match f(&mut cookie.inner).map_err(setting_errno) {
+                Ok(()) => 0,
+                Err(()) => libc::EOF,
+            },
+            None => 0,
+        }
+    }
+
     /**
     This function implements seek operations on the stream.
     When called, it receives three arguments:
@@ -181,232 +304,53 @@ impl VTable {
     If *seek is a null pointer, then it is not possible to
     perform seek operations on the stream.
      */
-    unsafe extern "C" fn seek<T: ?Sized + io::Seek>(
-        cookie: *mut c_void,
-        offset: *mut off_t,
-        whence: c_int,
-    ) -> c_int {
-        let seeker: &mut Cookie<T> = &mut *cookie.cast::<Cookie<T>>();
+    unsafe extern "C" fn seek(cookie: *mut c_void, offset: *mut off_t, whence: c_int) -> c_int {
+        let cookie = &mut *cookie.cast::<Cookie<T>>();
         let requested_offset = *offset;
         let pos = match whence {
-            libc::SEEK_SET => match requested_offset.try_into() {
+            libc::SEEK_SET => match requested_offset.try_into().map_err(setting_errno) {
                 Ok(it) => SeekFrom::Start(it),
-                Err(_) => {
-                    set_errno(libc::EOVERFLOW);
-                    return -1;
-                }
+                Err(()) => return -1,
             },
             libc::SEEK_CUR => SeekFrom::Current(requested_offset),
             libc::SEEK_END => SeekFrom::End(requested_offset),
-            _ => panic!("invalid value for `whence`: {}", whence),
+            _ => {
+                set_errno(libc::EINVAL);
+                return -1;
+            }
         };
-        match seeker.io.seek(pos).map_err(setting_errno) {
-            Ok(new_offset) => match new_offset.try_into() {
-                Ok(new_offset) => {
-                    *offset = new_offset;
-                    0
-                }
-                Err(_) => {
-                    set_errno(libc::EOVERFLOW);
-                    -1
-                }
+        match cookie.vtable.seek {
+            Some(f) => match f(&mut cookie.inner, pos).map_err(setting_errno) {
+                Ok(n) => match n.try_into().map_err(setting_errno) {
+                    Ok(new_offset) => {
+                        *offset = new_offset;
+                        0
+                    }
+                    Err(()) => -1,
+                },
+                Err(()) => -1,
             },
-            Err(_) => -1,
-        }
-    }
-}
-
-/// Builder for a [`libc::FILE`].
-///
-/// See [`module documentation`](mod@self) for more.
-pub struct Builder<T: ?Sized> {
-    vtable: VTable,
-    leak_if_panicking: bool,
-    _phantom: PhantomData<fn() -> T>,
-}
-
-impl<T: ?Sized> Builder<T> {
-    /// Start the builder.
-    pub const fn new() -> Self {
-        Self {
-            vtable: VTable {
-                read: None,
-                write: None,
-                seek: None,
-                flush: None,
-                drop: Some(VTable::drop::<T>),
-            },
-            leak_if_panicking: false,
-            _phantom: PhantomData,
-        }
-    }
-    /// Add [`io::Read`] support to the [`libc::FILE`].
-    pub const fn reading(mut self) -> Self
-    where
-        T: io::Read,
-    {
-        self.vtable.read = Some(VTable::read::<T>);
-        self
-    }
-    /// Add [`io::Write`] support to the [`libc::FILE`].
-    pub const fn writing(mut self) -> Self
-    where
-        T: io::Write,
-    {
-        self.vtable.write = Some(VTable::write::<T>);
-        self.vtable.flush = Some(VTable::flush::<T>);
-        self
-    }
-    /// Add [`io::Seek`] support to the [`libc::FILE`].
-    pub const fn seeking(mut self) -> Self
-    where
-        T: io::Seek,
-    {
-        self.vtable.seek = Some(VTable::seek::<T>);
-        self
-    }
-    /// When cleaning up a process the OS will typically flush/close all open files.
-    /// However, on unwinding, Rust's destructors will run _before_ that.
-    /// So if `T: !'static`, this will cause a double free!
-    ///
-    /// ```no_run
-    /// # use fopencookie::Mode;
-    /// // 1. Allocate on the stack
-    /// let mut v: vec![];
-    /// // 2. Register a file with the OS
-    /// //    This file depends on our stack!
-    /// fopencookie::Builder::new().build(Mode::ReadPlus, &mut v).unwrap();
-    /// // 3. Unwind the stack, calling the destructor for `v`
-    /// panic!();
-    /// // 4. After the stack has unwound,
-    /// //    the OS tries to flush/close the file.
-    /// //    But that memory has already been cleaned up, so you get instant UB!
-    /// ```
-    ///
-    /// For the specific case where the [`libc::FILE`] will only be used on the
-    /// current thread, and the thread panics,
-    /// you can choose to skip the destructor.
-    ///
-    /// This is NOT a general safety mechanism.
-    pub const fn leak_if_panicking(mut self) -> Self {
-        self.leak_if_panicking = true;
-        self
-    }
-    /// Make the call to [`fopencookie`](https://man7.org/linux/man-pages/man3/fopencookie.3.html).
-    pub fn build(self, mode: Mode, io: impl Into<Box<T>>) -> io::Result<NonNull<libc::FILE>> {
-        let Self {
-            vtable,
-            leak_if_panicking,
-            _phantom,
-        } = self;
-        let io_funcs = sys::cookie_io_functions_t {
-            read: Some({
-                unsafe extern "C" fn forward_read(
-                    cookie: *mut c_void,
-                    buf: *mut c_char,
-                    len: size_t,
-                ) -> c_long {
-                    let _cookie: &Cookie<()> = &*cookie.cast::<Cookie<()>>();
-                    match _cookie.vtable.read {
-                        Some(f) => f(cookie, buf, len),
-                        None => -1,
-                    }
-                }
-                forward_read
-            }),
-            write: Some({
-                unsafe extern "C" fn forward_write(
-                    cookie: *mut c_void,
-                    buf: *const c_char,
-                    len: size_t,
-                ) -> c_long {
-                    let _cookie: &Cookie<()> = &*cookie.cast::<Cookie<()>>();
-                    match _cookie.vtable.write {
-                        Some(f) => f(cookie, buf, len),
-                        None => {
-                            set_errno(libc::ENOTSUP);
-                            0
-                        }
-                    }
-                }
-                forward_write
-            }),
-            seek: Some({
-                unsafe extern "C" fn forward_seek(
-                    cookie: *mut c_void,
-                    offset: *mut off_t,
-                    whence: c_int,
-                ) -> c_int {
-                    let _cookie: &Cookie<()> = &*cookie.cast::<Cookie<()>>();
-                    match _cookie.vtable.seek {
-                        Some(f) => f(cookie, offset, whence),
-                        None => {
-                            set_errno(libc::ENOTSUP);
-                            -1
-                        }
-                    }
-                }
-                forward_seek
-            }),
-            close: Some({
-                unsafe extern "C" fn forward_flush_and_drop(cookie: *mut c_void) -> c_int {
-                    let _cookie: &Cookie<()> = &*cookie.cast::<Cookie<()>>();
-                    match (
-                        _cookie.leak_if_panicking,
-                        _cookie.vtable.drop,
-                        _cookie.vtable.flush,
-                    ) {
-                        (true, None, None) => 0,
-                        (true, None, Some(f)) => f(cookie),
-                        (true, Some(d), None) => match std::thread::panicking() {
-                            true => 0, // leak
-                            false => d(cookie),
-                        },
-                        (true, Some(d), Some(f)) => {
-                            let ret = f(cookie);
-                            match std::thread::panicking() {
-                                true => ret, // leak
-                                false => {
-                                    d(cookie);
-                                    ret
-                                }
-                            }
-                        }
-                        (false, None, None) => 0,
-                        (false, None, Some(f)) => f(cookie),
-                        (false, Some(d), None) => d(cookie),
-                        (false, Some(d), Some(f)) => {
-                            let ret = f(cookie);
-                            d(cookie);
-                            ret
-                        }
-                    }
-                }
-                forward_flush_and_drop
-            }),
-        };
-
-        let cookie = Box::into_raw(Box::new(Cookie {
-            vtable,
-            leak_if_panicking,
-            io: io.into(),
-        }));
-        let cookie = cookie.cast::<c_void>();
-        let ret = unsafe { sys::fopencookie(cookie, mode.as_cstr().as_ptr(), io_funcs) };
-
-        match NonNull::new(ret.cast::<libc::FILE>()) {
-            Some(it) => Ok(it),
             None => {
-                if let Some(d) = vtable.drop {
-                    unsafe { d(cookie) };
-                };
-                Err(io::Error::last_os_error())
+                set_errno(libc::ENOTSUP);
+                -1
             }
         }
     }
 }
 
+/// Configuration for leaking the [`libc::FILE`] handle.
+///
+/// See [`Builder::leak`] for more.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Leak {
+    /// Never drop the object when [`libc::fclose`] is called.
+    Always,
+    /// Drop the object unless [the current thread is panicking](std::thread::panicking).
+    IfPanicking,
+}
+
+/// The modes supported by [`fopencookie`](https://man7.org/linux/man-pages/man3/fopencookie.3.html).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub enum Mode {
     /// Open text file for reading.  The stream is positioned at
     /// the beginning of the file.
@@ -414,6 +358,7 @@ pub enum Mode {
 
     /// Open for reading and writing.  The stream is positioned at
     /// the beginning of the file.
+    #[default]
     ReadPlus,
 
     /// Truncate file to zero length or create text file for
@@ -515,20 +460,34 @@ pub struct UnrecognisedMode;
 
 impl fmt::Display for UnrecognisedMode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("unrecognised mode")
+        f.write_str("unrecognised mode (expected one of")?;
+        for it in Mode::ALL {
+            f.write_char(' ')?;
+            f.write_str(it.as_str())?;
+        }
+        f.write_char(')')
     }
 }
 
 impl std::error::Error for UnrecognisedMode {}
 
-struct Cookie<T: ?Sized> {
-    vtable: VTable,
-    leak_if_panicking: bool,
-    io: Box<T>, // allow this to be a trait object
+trait SetErrno {
+    fn errno(self) -> Option<c_int>;
 }
 
-fn setting_errno(e: io::Error) {
-    if let Some(errno) = e.raw_os_error() {
+impl SetErrno for io::Error {
+    fn errno(self) -> Option<c_int> {
+        self.raw_os_error()
+    }
+}
+impl SetErrno for TryFromIntError {
+    fn errno(self) -> Option<c_int> {
+        Some(libc::EOVERFLOW)
+    }
+}
+
+fn setting_errno(e: impl SetErrno) {
+    if let Some(errno) = e.errno() {
         set_errno(errno)
     }
 }
@@ -551,7 +510,7 @@ mod tests {
     fn borrowed() {
         let mut v = vec![];
         let file = Builder::new()
-            .writing()
+            .write()
             .build(Mode::WritePlus, &mut v)
             .unwrap();
         unsafe {
@@ -568,7 +527,7 @@ mod tests {
     fn trait_object() {
         let mut v = vec![];
         let file = Builder::<Box<dyn io::Write>>::new()
-            .writing()
+            .write()
             .build(Mode::WritePlus, Box::new(&mut v) as Box<dyn io::Write>)
             .unwrap();
         unsafe {
@@ -579,6 +538,27 @@ mod tests {
             assert_eq!(libc::fclose(file.as_ptr()), 0);
         };
         assert_eq!(v, TEST_TEXT.to_bytes());
+    }
+
+    #[test]
+    fn seek_with_no_seek() {
+        unsafe {
+            let handle = sys::fopencookie(
+                ptr::null_mut(),
+                Mode::Read.as_cstr().as_ptr(),
+                sys::cookie_io_functions_t {
+                    read: None,
+                    write: None,
+                    seek: None,
+                    close: None,
+                },
+            )
+            .cast::<libc::FILE>();
+            assert!(!handle.is_null());
+            let ret = libc::fseek(handle, 0, libc::SEEK_SET);
+            // dbg!(io::Error::last_os_error());
+            assert_eq!(ret, -1);
+        };
     }
 
     #[test]
@@ -638,11 +618,7 @@ mod tests {
             Mode::Write,
             Mode::WritePlus,
         ] {
-            let res = Builder::new()
-                .reading()
-                .writing()
-                .seeking()
-                .build(mode, Dummy);
+            let res = Builder::new().read().write().seek().build(mode, Dummy);
             let _ = dbg!(res);
         }
     }
