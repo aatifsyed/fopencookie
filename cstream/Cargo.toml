@@ -26,3 +26,7 @@ std = ["alloc", "libc/std"]
 
 [dev-dependencies]
 tempfile = "3.10.1"
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "do_doc_cfg"]

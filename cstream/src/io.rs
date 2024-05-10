@@ -4,8 +4,9 @@ use std::io;
 
 /// A wrapper around an [`AsCStream`] that implements [`std::io`] traits:
 /// - [`io::Read`] through [`libc::fread`].
-/// - [`io::Write`] through [`libc::fwrite`].
+/// - [`io::Write`] through [`libc::fwrite`] and [`libc::fflush`].
 /// - [`io::Seek`] through [`libc::fseek`] and [`libc::ftell`].
+#[cfg_attr(do_doc_cfg, doc(cfg(feature = "std")))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(transparent)]
 pub struct Io<T>(pub T);

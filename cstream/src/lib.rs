@@ -22,6 +22,7 @@ use libc::{c_char, c_int, c_void};
 
 #[cfg(feature = "std")]
 mod io;
+#[cfg_attr(do_doc_cfg, doc(cfg(feature = "std")))]
 #[cfg(feature = "std")]
 pub use io::Io;
 
@@ -77,6 +78,7 @@ impl IntoRawCStream for OwnedCStream {
 }
 
 #[cfg(feature = "alloc")]
+#[cfg_attr(do_doc_cfg, doc(cfg(feature = "alloc")))]
 #[derive(Debug)]
 pub struct BufferedCStream {
     stream: OwnedCStream,
@@ -112,6 +114,7 @@ impl BufferedCStream {
 }
 
 #[cfg(feature = "alloc")]
+#[cfg_attr(do_doc_cfg, doc(cfg(feature = "alloc")))]
 impl AsCStream for BufferedCStream {
     fn as_c_stream(&self) -> BorrowedCStream<'_> {
         self.stream.as_c_stream()
@@ -119,6 +122,7 @@ impl AsCStream for BufferedCStream {
 }
 
 #[cfg(feature = "alloc")]
+#[cfg_attr(do_doc_cfg, doc(cfg(feature = "alloc")))]
 impl AsRawCStream for BufferedCStream {
     fn as_raw_c_stream(&self) -> RawCStream {
         self.stream.as_raw_c_stream()
@@ -182,18 +186,21 @@ macro_rules! pointer_impls {
             }
         }
         #[cfg(feature = "alloc")]
+        #[cfg_attr(do_doc_cfg, doc(cfg(feature = "alloc")))]
         impl<T: $trait + ?Sized> $trait for alloc::boxed::Box<T> {
             fn $method(&self) -> $return {
                 T::$method(self)
             }
         }
         #[cfg(feature = "alloc")]
+        #[cfg_attr(do_doc_cfg, doc(cfg(feature = "alloc")))]
         impl<T: $trait + ?Sized> $trait for alloc::rc::Rc<T> {
             fn $method(&self) -> $return {
                 T::$method(self)
             }
         }
         #[cfg(feature = "alloc")]
+        #[cfg_attr(do_doc_cfg, doc(cfg(feature = "alloc")))]
         impl<T: $trait + ?Sized> $trait for alloc::sync::Arc<T> {
             fn $method(&self) -> $return {
                 T::$method(self)
@@ -276,6 +283,7 @@ fn ptr<T: AsCStream>(stream: &T) -> *mut libc::FILE {
     stream.as_c_stream().as_raw_c_stream().as_ptr()
 }
 
+/// Wrapper around [`libc::fflush`].
 #[allow(clippy::result_unit_err)]
 pub fn flush<T: AsCStream>(stream: T) -> Result<(), ()> {
     let ret = unsafe { libc::fflush(ptr(&stream)) };
@@ -286,11 +294,13 @@ pub fn flush<T: AsCStream>(stream: T) -> Result<(), ()> {
     }
 }
 
+/// Wrapper around [`libc::fopen`].
 pub fn open(filename: &CStr, mode: &CStr) -> Option<OwnedCStream> {
     let raw = NonNull::new(unsafe { libc::fopen(filename.as_ptr(), mode.as_ptr()) })?;
     Some(unsafe { OwnedCStream::from_raw_c_stream(raw) })
 }
 
+/// Wrapper around [`libc::freopen`].
 pub fn reopen(filename: Option<&CStr>, mode: &CStr, stream: OwnedCStream) -> Option<OwnedCStream> {
     let raw = NonNull::new(unsafe {
         libc::freopen(
@@ -302,6 +312,7 @@ pub fn reopen(filename: Option<&CStr>, mode: &CStr, stream: OwnedCStream) -> Opt
     Some(unsafe { OwnedCStream::from_raw_c_stream(raw) })
 }
 
+/// Wrapper around [`libc::fileno`].
 pub fn fileno<T: AsCStream>(stream: T) -> Option<c_int> {
     match unsafe { libc::fileno(ptr(&stream)) } {
         -1 => None,
@@ -312,6 +323,8 @@ pub fn fileno<T: AsCStream>(stream: T) -> Option<c_int> {
 /////////////////////////
 // Character input/output
 /////////////////////////
+
+/// Wrapper around [`libc::fgetc`].
 pub fn getc<T: AsCStream>(stream: T) -> Option<u8> {
     match unsafe { libc::fgetc(ptr(&stream)) } {
         libc::EOF => None,
@@ -319,6 +332,7 @@ pub fn getc<T: AsCStream>(stream: T) -> Option<u8> {
     }
 }
 
+/// Wrapper around [`libc::ungetc`].
 #[allow(clippy::result_unit_err)]
 pub fn ungetc<T: AsCStream>(char: u8, stream: T) -> Result<(), ()> {
     match unsafe { libc::ungetc(char as c_int, ptr(&stream)) } {
@@ -327,6 +341,7 @@ pub fn ungetc<T: AsCStream>(char: u8, stream: T) -> Result<(), ()> {
     }
 }
 
+/// Wrapper around [`libc::fgets`].
 pub fn gets<T: AsCStream>(buf: &mut [u8], stream: T) -> Option<&CStr> {
     match unsafe {
         libc::fgets(
@@ -342,6 +357,7 @@ pub fn gets<T: AsCStream>(buf: &mut [u8], stream: T) -> Option<&CStr> {
     }
 }
 
+/// Wrapper around [`libc::fputc`].
 #[allow(clippy::result_unit_err, clippy::if_same_then_else)]
 pub fn putc<T: AsCStream>(char: u8, stream: T) -> Result<(), ()> {
     let ret = unsafe { libc::fputc(char as c_int, ptr(&stream)) };
@@ -352,6 +368,7 @@ pub fn putc<T: AsCStream>(char: u8, stream: T) -> Result<(), ()> {
     }
 }
 
+/// Wrapper around [`libc::fputs`].
 #[allow(clippy::result_unit_err)]
 pub fn puts<T: AsCStream>(s: &CStr, stream: T) -> Result<(), ()> {
     let ret = unsafe { libc::fputs(s.as_ptr(), ptr(&stream)) };
@@ -368,6 +385,7 @@ pub fn puts<T: AsCStream>(s: &CStr, stream: T) -> Result<(), ()> {
 // Direct input/output
 //////////////////////
 
+/// Wrapper around [`libc::fread`].
 pub fn read<T: AsCStream>(buf: &mut [u8], stream: T) -> usize {
     unsafe {
         libc::fread(
@@ -379,13 +397,17 @@ pub fn read<T: AsCStream>(buf: &mut [u8], stream: T) -> usize {
     }
 }
 
+/// Wrapper around [`libc::fwrite`].
 pub fn write<T: AsCStream>(buf: &[u8], stream: T) -> usize {
     unsafe { libc::fwrite(buf.as_ptr().cast::<c_void>(), 1, buf.len(), ptr(&stream)) }
 }
 ///////////////////
 // File positioning
 ///////////////////
+
+/// Wrapper around [`libc::fseek`].
 #[cfg(feature = "std")]
+#[cfg_attr(do_doc_cfg, doc(cfg(feature = "std")))]
 #[allow(clippy::result_unit_err)]
 pub fn seek<T: AsCStream>(stream: T, pos: std::io::SeekFrom) -> Result<(), ()> {
     let (offset, whence) = match pos {
@@ -400,10 +422,12 @@ pub fn seek<T: AsCStream>(stream: T, pos: std::io::SeekFrom) -> Result<(), ()> {
     }
 }
 
+/// Wrapper around [`libc::ftell`].
 pub fn tell<T: AsCStream>(stream: T) -> Option<u64> {
     unsafe { libc::ftell(ptr(&stream)) }.try_into().ok()
 }
 
+/// Wrapper around [`libc::rewind`].
 pub fn rewind<T: AsCStream>(stream: T) {
     unsafe { libc::rewind(ptr(&stream)) }
 }
@@ -412,15 +436,17 @@ pub fn rewind<T: AsCStream>(stream: T) {
 // Error-handling
 /////////////////
 
+/// Wrapper around [`libc::feof`].
 pub fn eof<T: AsCStream>(stream: T) -> bool {
     unsafe { libc::feof(ptr(&stream)) != 0 }
 }
 
+/// Wrapper around [`libc::clearerr`].
 pub fn clear_errors<T: AsCStream>(stream: T) {
     unsafe { libc::clearerr(ptr(&stream)) }
 }
 
-/// A capture of the error indicator on a [`RawCStream`].
+/// A capture of the error indicator on a [`RawCStream`] through [`libc::ferror`].
 #[derive(Debug, Clone)]
 pub struct FError(pub i32);
 
