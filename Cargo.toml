@@ -14,6 +14,6 @@ repository = "https://github.com/aatifsyed/fopencookie"
 members = ["cstream", "sys"]
 
 [dependencies]
-cstream = { version = "0.1.2", path = "cstream" }
+cstream = { version = "0.1.3", path = "cstream" }
 fopencookie-sys = { version = "0.1.1", path = "sys" }
 libc = "0.2.154"
