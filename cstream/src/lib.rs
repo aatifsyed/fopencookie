@@ -67,6 +67,57 @@ impl IntoRawCStream for OwnedCStream {
     }
 }
 
+#[cfg(feature = "alloc")]
+#[derive(Debug)]
+pub struct BufferedCStream {
+    stream: OwnedCStream,
+    #[allow(unused)]
+    buffer: alloc::boxed::Box<[u8]>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum BufferMode {
+    Block,
+    Line,
+}
+
+#[cfg(feature = "alloc")]
+impl BufferedCStream {
+    /// # Safety
+    /// - The address of the `buffer` must not change for the lifetime of this stream.
+    pub unsafe fn new(stream: OwnedCStream, size: usize, mode: BufferMode) -> Option<Self> {
+        let mut buffer = alloc::vec![0; size].into_boxed_slice();
+        match unsafe {
+            libc::setvbuf(
+                ptr(&stream),
+                buffer.as_mut_ptr().cast::<c_char>(),
+                match mode {
+                    BufferMode::Block => libc::_IOFBF,
+                    BufferMode::Line => libc::_IONBF,
+                },
+                buffer.len(),
+            )
+        } {
+            0 => Some(Self { stream, buffer }),
+            _ => None,
+        }
+    }
+}
+
+#[cfg(feature = "alloc")]
+impl AsCStream for BufferedCStream {
+    fn as_c_stream(&self) -> BorrowedCStream<'_> {
+        self.stream.as_c_stream()
+    }
+}
+
+#[cfg(feature = "alloc")]
+impl AsRawCStream for BufferedCStream {
+    fn as_raw_c_stream(&self) -> RawCStream {
+        self.stream.as_raw_c_stream()
+    }
+}
+
 /// A borrowed [`RawCStream`].
 ///
 /// This has a lifetime parameter to tie it to the lifetime of something that owns the stream.
