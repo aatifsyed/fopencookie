@@ -13,8 +13,12 @@ use core::{
     mem,
     ptr::{self, NonNull},
 };
-
 use libc::{c_char, c_int, c_void};
+
+#[cfg(feature = "std")]
+mod io;
+#[cfg(feature = "std")]
+pub use io::Io;
 
 /// A [`libc::FILE`] stream.
 pub type RawCStream = NonNull<libc::FILE>;
@@ -431,13 +435,20 @@ impl fmt::Display for FError {
 impl std::error::Error for FError {}
 
 #[cfg(all(test, feature = "std"))]
+fn read_to_string(mut f: impl std::io::Read) -> String {
+    let mut s = String::new();
+    f.read_to_string(&mut s).unwrap();
+    s
+}
+
+#[cfg(all(test, feature = "std"))]
 mod tests {
     use super::*;
     use std::{ffi::CString, fs, os::unix::ffi::OsStrExt as _};
     use tempfile::NamedTempFile;
 
     #[test]
-    fn test_write() {
+    fn test() {
         let named = NamedTempFile::new().unwrap();
         let path = CString::new(named.path().as_os_str().as_bytes()).unwrap();
         let stream = open(&path, c"rw+").unwrap();

@@ -11,7 +11,7 @@ libc = { version = "0.2.154", default-features = false }
 [features]
 default = ["std"]
 alloc = []
-std = ["alloc"]
+std = ["alloc", "libc/std"]
 
 [dev-dependencies]
 tempfile = "3.10.1"
