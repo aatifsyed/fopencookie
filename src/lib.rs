@@ -658,21 +658,33 @@ mod tests {
     #[test]
     fn borrowed() {
         let mut v = vec![];
-        let file = Builder::new().write().build(&mut v);
+        let stream = Builder::new().write().build(&mut v);
 
-        assert_eq!(cstream::write(TEST_TEXT.as_bytes(), file), TEST_TEXT.len());
+        assert_eq!(
+            cstream::write(TEST_TEXT.as_bytes(), stream),
+            TEST_TEXT.len()
+        );
         assert_eq!(v, TEST_TEXT.as_bytes());
     }
 
     #[test]
     fn trait_object() {
         let mut v = vec![];
-        let file = Builder::<Box<dyn io::Write>>::new()
+        let stream = Builder::<Box<dyn io::Write>>::new()
             .write()
             .build(Box::new(&mut v));
 
-        assert_eq!(cstream::write(TEST_TEXT.as_bytes(), file), TEST_TEXT.len());
+        assert_eq!(
+            cstream::write(TEST_TEXT.as_bytes(), stream),
+            TEST_TEXT.len()
+        );
         assert_eq!(v, TEST_TEXT.as_bytes());
+    }
+
+    #[test]
+    fn streams_have_no_fileno() {
+        let stream = IoCStream::writer(io::empty());
+        assert_eq!(cstream::fileno(&stream), None);
     }
 
     #[test]
