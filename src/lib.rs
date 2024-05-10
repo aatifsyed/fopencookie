@@ -1,22 +1,18 @@
-//! Convert an [`io::Write`]/[`io::Read`] to a [`libc::FILE`] stream using the [`fopencookie`](https://man7.org/linux/man-pages/man3/fopencookie.3.html) syscall.
+//! Convert an [`io::Write`]/[`io::Read`]/[`io::Seek`] to a [`libc::FILE`] stream
+//! using the [`fopencookie`](https://man7.org/linux/man-pages/man3/fopencookie.3.html) syscall.
 //!
+//! Great for passing rust traits across FFI.
 //! ```
-//! # use fopencookie::Mode;
 //! let mut v = vec![];
-//! let ffi = fopencookie::Builder::new()
-//!     .writing()
-//!     .build(Mode::ReadPlus, &mut v)
-//!     .unwrap();
+//! let stream = fopencookie::IoCStream::writer(&mut v);
 //!
-//! // Use the *mut FILE
-//! unsafe {
-//!     assert!(
-//!         libc::fprintf(ffi.as_ptr(), c"hello, world!".as_ptr()) == 13
-//!     );
-//!     assert!(
-//!         libc::fflush(ffi.as_ptr()) == 0
-//!     );
-//! }
+//! // Use the libc stream functions
+//! assert_eq!(
+//!     unsafe {
+//!         libc::fprintf(stream.as_ptr(), c"hello, world!".as_ptr())
+//!     },
+//!     13 // all bytes written
+//! );
 //!
 //! // It's reflected in our rust type!
 //! assert_eq!(v, b"hello, world!");
@@ -26,13 +22,22 @@
 //!
 //! ```
 //! # use std::io;
-//! # use fopencookie::Mode;
-//! let mut writer: Box<dyn io::Write>;
-//! # writer = Box::new(vec![]);
-//! let ffi = fopencookie::Builder::<Box<dyn io::Write>>::new()
-//!     .writing()
-//!     .build(Mode::ReadPlus, writer)
-//!     .unwrap();
+//! let mut reader: Box<dyn io::Read>;
+//! # reader = Box::new(io::empty());
+//! let stream = fopencookie::IoCStream::reader(reader);
+//! ```
+//!
+//! You can use the [`Builder`] for more flexibility.
+//!
+//! ```no_run
+//! # use std::fs::File;
+//! let mut file: File;
+//! # file = unimplemented!();
+//! let stream = fopencookie::Builder::new()
+//!     .read()
+//!     .write()
+//!     .seek()
+//!     .build(file);
 //! ```
 
 use core::fmt;
@@ -84,10 +89,11 @@ enum Action<T> {
     Unsupported,
 }
 
-/// Builder for a call to [`fopencookie`](https://man7.org/linux/man-pages/man3/fopencookie.3.html).
+/// Builder for [`IoCStream`] where you opt-in to forwarding [`io`] traits from
+/// the underlying type.
 ///
 /// See [module documentation](mod@self) for more.
-#[must_use = "Call `build` to actually create the file handle"]
+#[must_use = "Call `build` to actually create the IoStream"]
 pub struct Builder<T> {
     vtable: VTable<T>,
 }
@@ -104,6 +110,7 @@ impl<T> Builder<T> {
             },
         }
     }
+    /// Enable [`io::Read`] on the [`IoCStream`].
     pub const fn read(mut self) -> Self
     where
         T: io::Read,
@@ -111,6 +118,7 @@ impl<T> Builder<T> {
         self.vtable.read = Action::Do(T::read);
         self
     }
+    /// Enable [`io::Write`] on the [`IoCStream`].
     pub const fn write(mut self) -> Self
     where
         T: io::Write,
@@ -118,6 +126,7 @@ impl<T> Builder<T> {
         self.vtable.write = Action::Do(T::write);
         self
     }
+    /// Enable [`io::Seek`] on the [`IoCStream`].
     pub const fn seek(mut self) -> Self
     where
         T: io::Seek,
@@ -125,6 +134,10 @@ impl<T> Builder<T> {
         self.vtable.seek = Some(T::seek);
         self
     }
+    /// By default, [`libc::read`]/[`libc::write`] operations on [`IoCStream`] will be ignored
+    /// if they haven't been enabled with this builder.
+    ///
+    /// Calling this function makes such attempts return an error instead.
     pub const fn strict(mut self) -> Self {
         if matches!(self.vtable.read, Action::Ignore) {
             self.vtable.read = Action::Unsupported
@@ -134,10 +147,19 @@ impl<T> Builder<T> {
         }
         self
     }
-    pub fn build(self, inner: T) -> io::Result<IoStream<T>> {
+    /// Finish the build, with a default [`Mode::ReadPlus`].
+    ///
+    /// # Panics
+    /// - See [`Self::build_with_mode`].
+    pub fn build(self, inner: T) -> IoCStream<T> {
         self.build_with_mode(Mode::default(), inner)
     }
-    pub fn build_with_mode(self, mode: Mode, inner: T) -> io::Result<IoStream<T>> {
+    /// Finish the build.
+    ///
+    /// # Panics
+    /// - If the underlying call to [`fopencookie`](https://man7.org/linux/man-pages/man3/fopencookie.3.html)
+    ///   fails (typically due to an allocation failure)
+    pub fn build_with_mode(self, mode: Mode, inner: T) -> IoCStream<T> {
         let Self { vtable } = self;
         let cookie = Box::new(Cookie {
             vtable,
@@ -160,58 +182,128 @@ impl<T> Builder<T> {
             Some(raw) => {
                 // remove buffering.
                 unsafe { libc::setbuf(raw.as_ptr(), ptr::null_mut()) }
-                Ok(IoStream {
+                IoCStream {
                     stream: unsafe { OwnedCStream::from_raw_c_stream(raw) },
                     cookie,
-                })
+                }
             }
-            None => Err(io::Error::last_os_error()),
+            None => panic!(
+                "call to `fopencookie` failed, despite having a valid `mode`,\
+                 perhaps an allocation failed?\
+                 last os error: {}",
+                io::Error::last_os_error()
+            ),
         }
     }
 }
 
+/// Compatibility layer between [`io::Read`]/[`io::Write`]/[`io::Seek`] and
+/// [`libc::FILE`] streams.
+///
+/// This implements [`cstream`] traits for accessing the stream, or you can
+/// do so via [`Self::as_ptr`].
+///
+/// This struct owns two resources with tied lifetimes:
+/// - The underlying io type, `T`.
+/// - An open [`libc::FILE`] stream.
 #[derive(Debug)]
-pub struct IoStream<T> {
+pub struct IoCStream<T> {
     // this needs to be first so that it's dropped first
     stream: OwnedCStream,
     cookie: Box<Cookie<T>>,
 }
 
-impl<T> IoStream<T> {
+impl<T> IoCStream<T> {
+    /// Convenience function for an [`io::Read`].
+    ///
+    /// See [`Builder`] for more.
+    pub fn reader(inner: T) -> Self
+    where
+        T: io::Read,
+    {
+        Builder::new().read().build_with_mode(Mode::Read, inner)
+    }
+    /// Convenience function for an [`io::Write`].
+    ///
+    /// See [`Builder`] for more.
+    pub fn writer(inner: T) -> Self
+    where
+        T: io::Write,
+    {
+        Builder::new().write().build_with_mode(Mode::Write, inner)
+    }
+    /// Get a shared reference ot the inner io resource.
     pub fn get_ref(&self) -> &T {
         &self.cookie.inner
     }
+    /// Get a mutable reference ot the inner io resource.
     pub fn get_mut(&mut self) -> &mut T {
         &mut self.cookie.inner
     }
+    /// Consume this object, [`libc::fclose`]-ing the associated stream.
+    /// [`libc::FILE`] pointers from this object MUST NOT be used after this point.
     pub fn into_inner(self) -> T {
         self.cookie.inner
     }
+    /// Shortcut via [`AsRawCStream::as_raw_c_stream`], without requiring that
+    /// trait to be in scope.
+    ///
+    /// Calling [`libc::fclose`] on this pointer will result in undefined behaviour.
+    pub fn as_ptr(&self) -> *mut libc::FILE {
+        self.as_raw_c_stream().as_ptr()
+    }
+    /// Defers freeing the inner io to the [`OwnedCStream`].
+    ///
+    /// # Safety
+    /// - The returned object must NOT outlive any underlying io.
+    ///   This is trivial if `T: 'static`.
+    pub unsafe fn into_owned_c_stream_unchecked(self) -> OwnedCStream {
+        let Self { stream, mut cookie } = self;
+        cookie.drop_on_close = true;
+        mem::forget(cookie);
+        stream
+    }
+    /// Defers freeing the inner io to the [`OwnedCStream`].
+    pub fn into_owned_c_stream(self) -> OwnedCStream
+    where
+        T: 'static,
+    {
+        unsafe { self.into_owned_c_stream_unchecked() }
+    }
 }
 
-impl<T> AsCStream for IoStream<T> {
+impl<T> From<IoCStream<T>> for OwnedCStream
+where
+    T: 'static,
+{
+    fn from(value: IoCStream<T>) -> Self {
+        value.into_owned_c_stream()
+    }
+}
+
+impl<T> AsCStream for IoCStream<T> {
     fn as_c_stream(&self) -> BorrowedCStream<'_> {
         self.stream.as_c_stream()
     }
 }
 
-impl<T> AsRawCStream for IoStream<T> {
+impl<T> AsRawCStream for IoCStream<T> {
     fn as_raw_c_stream(&self) -> cstream::RawCStream {
         self.stream.as_raw_c_stream()
     }
 }
 
-impl<T> IntoRawCStream for IoStream<T> {
-    /// Freeing the underlying `T` is deferred to [`libc::fclose`].
+impl<T> IntoRawCStream for IoCStream<T>
+where
+    T: 'static,
+{
+    /// See [`Self::into_owned_c_stream`]
     fn into_raw_c_stream(self) -> cstream::RawCStream {
-        let Self { stream, mut cookie } = self;
-        cookie.drop_on_close = true;
-        mem::forget(cookie);
-        stream.into_raw_c_stream()
+        self.into_owned_c_stream().into_raw_c_stream()
     }
 }
 
-impl<T: io::Write> io::Write for IoStream<T> {
+impl<T: io::Write> io::Write for IoCStream<T> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         self.cookie.inner.write(buf)
     }
@@ -220,20 +312,20 @@ impl<T: io::Write> io::Write for IoStream<T> {
     }
 }
 
-impl<T: io::Read> io::Read for IoStream<T> {
+impl<T: io::Read> io::Read for IoCStream<T> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         self.cookie.inner.read(buf)
     }
 }
 
-impl<T: io::Seek> io::Seek for IoStream<T> {
+impl<T: io::Seek> io::Seek for IoCStream<T> {
     fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
         self.cookie.inner.seek(pos)
     }
 }
 
-unsafe impl<T: Send> Send for IoStream<T> {}
-unsafe impl<T: Sync> Sync for IoStream<T> {}
+unsafe impl<T: Send> Send for IoCStream<T> {}
+unsafe impl<T: Sync> Sync for IoCStream<T> {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct Cookie<T> {
@@ -242,6 +334,7 @@ struct Cookie<T> {
     inner: T,
 }
 
+#[cfg(not(doctest))]
 impl<T> Cookie<T> {
     /**
     This function implements read operations for the stream.
@@ -565,7 +658,7 @@ mod tests {
     #[test]
     fn borrowed() {
         let mut v = vec![];
-        let file = Builder::new().write().build(&mut v).unwrap();
+        let file = Builder::new().write().build(&mut v);
 
         assert_eq!(cstream::write(TEST_TEXT.as_bytes(), file), TEST_TEXT.len());
         assert_eq!(v, TEST_TEXT.as_bytes());
@@ -576,8 +669,7 @@ mod tests {
         let mut v = vec![];
         let file = Builder::<Box<dyn io::Write>>::new()
             .write()
-            .build(Box::new(&mut v))
-            .unwrap();
+            .build(Box::new(&mut v));
 
         assert_eq!(cstream::write(TEST_TEXT.as_bytes(), file), TEST_TEXT.len());
         assert_eq!(v, TEST_TEXT.as_bytes());

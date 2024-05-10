@@ -20,7 +20,7 @@ use libc::{c_char, c_int, c_void};
 pub type RawCStream = NonNull<libc::FILE>;
 
 /// An owned [`RawCStream`].
-/// This closes the stream on drop.
+/// This [`libc::fclose`]s the stream on drop.
 /// It is guaranteed that nobody else will close the stream.
 ///
 /// This uses `#[repr(transparent)]` and has the representation of a host stream,
@@ -83,9 +83,7 @@ pub enum BufferMode {
 
 #[cfg(feature = "alloc")]
 impl BufferedCStream {
-    /// # Safety
-    /// - The address of the `buffer` must not change for the lifetime of this stream.
-    pub unsafe fn new(stream: OwnedCStream, size: usize, mode: BufferMode) -> Option<Self> {
+    pub fn new(stream: OwnedCStream, size: usize, mode: BufferMode) -> Option<Self> {
         let mut buffer = alloc::vec![0; size].into_boxed_slice();
         match unsafe {
             libc::setvbuf(
@@ -281,13 +279,6 @@ pub fn flush<T: AsCStream>(stream: T) -> Result<(), ()> {
 
 pub fn open(filename: &CStr, mode: &CStr) -> Option<OwnedCStream> {
     let raw = NonNull::new(unsafe { libc::fopen(filename.as_ptr(), mode.as_ptr()) })?;
-    Some(unsafe { OwnedCStream::from_raw_c_stream(raw) })
-}
-
-#[cfg(feature = "std")]
-pub fn fdopen<T: std::os::fd::IntoRawFd>(fd: T, mode: &CStr) -> Option<OwnedCStream> {
-    let fd = fd.into_raw_fd();
-    let raw = NonNull::new(unsafe { libc::fdopen(fd, mode.as_ptr()) })?;
     Some(unsafe { OwnedCStream::from_raw_c_stream(raw) })
 }
 
