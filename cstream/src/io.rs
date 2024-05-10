@@ -2,8 +2,10 @@ use crate::{ptr, AsCStream, FError};
 use libc::c_void;
 use std::io;
 
-/// A wrapper around an [`AsCStream`] that implements [`io::Read`], [`io::Write`]
-/// and [`io::Seek`] through [`libc`] functions.
+/// A wrapper around an [`AsCStream`] that implements [`io`] traits:
+/// - [`io::Read`] through [`libc::fread`].
+/// - [`io::Write`] through [`libc::fwrite`].
+/// - [`io::Seek`] through [`libc::fseek`] and [`libc::ftell`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(transparent)]
 pub struct Io<T>(pub T);
