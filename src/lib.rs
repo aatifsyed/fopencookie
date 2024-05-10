@@ -70,17 +70,6 @@ struct VTable<T> {
     seek: Option<SeekFnPtr<T>>,
 }
 
-impl<T> Default for VTable<T> {
-    fn default() -> Self {
-        Self {
-            read: Default::default(),
-            write: Default::default(),
-            flush: Default::default(),
-            seek: Default::default(),
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 enum Action<T> {
     Do(T),

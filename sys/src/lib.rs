@@ -1,3 +1,5 @@
+//! Platform bindigns for [`fopencookie`](https://docs.rs/fopencookie)
+
 #![allow(
     non_upper_case_globals,
     non_camel_case_types,

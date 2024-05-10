@@ -2,8 +2,19 @@
 name = "cstream"
 version = "0.1.0"
 edition = "2021"
-
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+description = "utilities for `libc::FILE` streams 'c streams'"
+categories = [
+    "embedded",
+    "external-ffi-bindings",
+    "no-std",
+    "os",
+    "no-std::no-alloc",
+]
+keywords = ["libc", "stream", "ffi"]
+license = "MIT OR Apache-2.0"
+homepage = "https://crates.io/cstream"
+documentation = "https://docs.rs/cstream"
+repository = "https://github.com/aatifsyed/fopencookie"
 
 [dependencies]
 libc = { version = "0.2.154", default-features = false }

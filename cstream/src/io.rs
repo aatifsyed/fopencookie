@@ -2,7 +2,7 @@ use crate::{ptr, AsCStream, FError};
 use libc::c_void;
 use std::io;
 
-/// A wrapper around an [`AsCStream`] that implements [`io`] traits:
+/// A wrapper around an [`AsCStream`] that implements [`std::io`] traits:
 /// - [`io::Read`] through [`libc::fread`].
 /// - [`io::Write`] through [`libc::fwrite`].
 /// - [`io::Seek`] through [`libc::fseek`] and [`libc::ftell`].

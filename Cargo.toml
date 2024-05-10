@@ -2,11 +2,16 @@
 name = "fopencookie"
 version = "0.1.0"
 edition = "2021"
+description = "interface between std::io and libc::FILE"
+categories = ["external-ffi-bindings", "filesystem", "os", "api-bindings"]
+keywords = ["libc", "stream", "ffi", "fopencookie"]
+license = "MIT OR Apache-2.0"
+homepage = "https://crates.io/fopencookie"
+documentation = "https://docs.rs/fopencookie"
+repository = "https://github.com/aatifsyed/fopencookie"
 
 [workspace]
 members = ["cstream", "sys"]
-
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
 cstream = { version = "0.1.0", path = "cstream" }

@@ -2,6 +2,19 @@
 name = "fopencookie-sys"
 version = "0.1.0"
 edition = "2021"
+description = "bindings to <stdio.h>::fopencookie"
+categories = [
+    "embedded",
+    "external-ffi-bindings",
+    "no-std",
+    "os",
+    "api-bindings",
+]
+keywords = ["libc", "stream", "ffi"]
+license = "MIT OR Apache-2.0"
+homepage = "https://crates.io/fopencookie-sys"
+documentation = "https://docs.rs/fopencookie-sys"
+repository = "https://github.com/aatifsyed/fopencookie"
 
 [build-dependencies]
 bindgen = "0.69.4"
