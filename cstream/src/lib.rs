@@ -8,6 +8,8 @@
 //! - An [`Io`] wrapper, which implements [`io`](std::io) traits.
 
 #![cfg_attr(not(feature = "std"), no_std)]
+#![cfg_attr(do_doc_cfg, feature(doc_cfg))]
+
 #[cfg(feature = "alloc")]
 extern crate alloc;
 
