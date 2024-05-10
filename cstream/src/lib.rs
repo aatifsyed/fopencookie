@@ -264,13 +264,14 @@ pub fn tmpfile() -> Option<OwnedCStream> {
 // File access
 //////////////
 
-fn ptr<T: AsCStream>(stream: T) -> *mut libc::FILE {
+/// Take `&T` to ensure that `stream` is alive for the outer scope
+fn ptr<T: AsCStream>(stream: &T) -> *mut libc::FILE {
     stream.as_c_stream().as_raw_c_stream().as_ptr()
 }
 
 #[allow(clippy::result_unit_err)]
 pub fn flush<T: AsCStream>(stream: T) -> Result<(), ()> {
-    let ret = unsafe { libc::fflush(ptr(stream)) };
+    let ret = unsafe { libc::fflush(ptr(&stream)) };
     match ret {
         0 => Ok(()),
         libc::EOF => Err(()),
@@ -302,7 +303,7 @@ pub fn reopen(filename: Option<&CStr>, mode: &CStr, stream: OwnedCStream) -> Opt
 }
 
 pub fn fileno<T: AsCStream>(stream: T) -> Option<c_int> {
-    match unsafe { libc::fileno(ptr(stream)) } {
+    match unsafe { libc::fileno(ptr(&stream)) } {
         -1 => None,
         other => Some(other),
     }
@@ -312,7 +313,7 @@ pub fn fileno<T: AsCStream>(stream: T) -> Option<c_int> {
 // Character input/output
 /////////////////////////
 pub fn getc<T: AsCStream>(stream: T) -> Option<u8> {
-    match unsafe { libc::fgetc(ptr(stream)) } {
+    match unsafe { libc::fgetc(ptr(&stream)) } {
         libc::EOF => None,
         it => Some(it as u8),
     }
@@ -320,7 +321,7 @@ pub fn getc<T: AsCStream>(stream: T) -> Option<u8> {
 
 #[allow(clippy::result_unit_err)]
 pub fn ungetc<T: AsCStream>(char: u8, stream: T) -> Result<(), ()> {
-    match unsafe { libc::ungetc(char as c_int, ptr(stream)) } {
+    match unsafe { libc::ungetc(char as c_int, ptr(&stream)) } {
         libc::EOF => Err(()),
         _ => Ok(()),
     }
@@ -331,7 +332,7 @@ pub fn gets<T: AsCStream>(buf: &mut [u8], stream: T) -> Option<&CStr> {
         libc::fgets(
             buf.as_mut_ptr().cast::<c_char>(),
             buf.len().try_into().ok()?,
-            ptr(stream),
+            ptr(&stream),
         )
     }
     .is_null()
@@ -343,7 +344,7 @@ pub fn gets<T: AsCStream>(buf: &mut [u8], stream: T) -> Option<&CStr> {
 
 #[allow(clippy::result_unit_err, clippy::if_same_then_else)]
 pub fn putc<T: AsCStream>(char: u8, stream: T) -> Result<(), ()> {
-    let ret = unsafe { libc::fputc(char as c_int, ptr(stream)) };
+    let ret = unsafe { libc::fputc(char as c_int, ptr(&stream)) };
     if ret == libc::EOF {
         Err(())
     } else {
@@ -353,7 +354,7 @@ pub fn putc<T: AsCStream>(char: u8, stream: T) -> Result<(), ()> {
 
 #[allow(clippy::result_unit_err)]
 pub fn puts<T: AsCStream>(s: &CStr, stream: T) -> Result<(), ()> {
-    let ret = unsafe { libc::fputs(s.as_ptr(), ptr(stream)) };
+    let ret = unsafe { libc::fputs(s.as_ptr(), ptr(&stream)) };
     if ret == libc::EOF {
         Err(())
     } else if ret > 0 {
@@ -368,11 +369,18 @@ pub fn puts<T: AsCStream>(s: &CStr, stream: T) -> Result<(), ()> {
 //////////////////////
 
 pub fn read<T: AsCStream>(buf: &mut [u8], stream: T) -> usize {
-    unsafe { libc::fread(buf.as_mut_ptr().cast::<c_void>(), 1, buf.len(), ptr(stream)) }
+    unsafe {
+        libc::fread(
+            buf.as_mut_ptr().cast::<c_void>(),
+            1,
+            buf.len(),
+            ptr(&stream),
+        )
+    }
 }
 
 pub fn write<T: AsCStream>(buf: &[u8], stream: T) -> usize {
-    unsafe { libc::fwrite(buf.as_ptr().cast::<c_void>(), 1, buf.len(), ptr(stream)) }
+    unsafe { libc::fwrite(buf.as_ptr().cast::<c_void>(), 1, buf.len(), ptr(&stream)) }
 }
 ///////////////////
 // File positioning
@@ -385,7 +393,7 @@ pub fn seek<T: AsCStream>(stream: T, pos: std::io::SeekFrom) -> Result<(), ()> {
         std::io::SeekFrom::End(it) => (it, libc::SEEK_END),
         std::io::SeekFrom::Current(it) => (it, libc::SEEK_CUR),
     };
-    match unsafe { libc::fseek(ptr(stream), offset, whence) } {
+    match unsafe { libc::fseek(ptr(&stream), offset, whence) } {
         0 => Ok(()),
         -1 => Err(()),
         _undocumented => Err(()),
@@ -393,11 +401,11 @@ pub fn seek<T: AsCStream>(stream: T, pos: std::io::SeekFrom) -> Result<(), ()> {
 }
 
 pub fn tell<T: AsCStream>(stream: T) -> Option<u64> {
-    unsafe { libc::ftell(ptr(stream)) }.try_into().ok()
+    unsafe { libc::ftell(ptr(&stream)) }.try_into().ok()
 }
 
 pub fn rewind<T: AsCStream>(stream: T) {
-    unsafe { libc::rewind(ptr(stream)) }
+    unsafe { libc::rewind(ptr(&stream)) }
 }
 
 /////////////////
@@ -405,11 +413,11 @@ pub fn rewind<T: AsCStream>(stream: T) {
 /////////////////
 
 pub fn eof<T: AsCStream>(stream: T) -> bool {
-    unsafe { libc::feof(ptr(stream)) != 0 }
+    unsafe { libc::feof(ptr(&stream)) != 0 }
 }
 
 pub fn clear_errors<T: AsCStream>(stream: T) {
-    unsafe { libc::clearerr(ptr(stream)) }
+    unsafe { libc::clearerr(ptr(&stream)) }
 }
 
 /// A capture of the error indicator on a [`RawCStream`].
@@ -418,7 +426,7 @@ pub struct FError(pub i32);
 
 impl FError {
     pub fn of<T: AsCStream>(stream: T) -> Self {
-        Self(unsafe { libc::ferror(ptr(stream)) })
+        Self(unsafe { libc::ferror(ptr(&stream)) })
     }
 }
 

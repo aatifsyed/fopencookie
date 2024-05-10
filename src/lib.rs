@@ -47,7 +47,7 @@ use std::{
     io::{self, SeekFrom},
     mem,
     num::TryFromIntError,
-    ptr::NonNull,
+    ptr::{self, NonNull},
     slice,
     str::FromStr,
 };
@@ -134,10 +134,10 @@ impl<T> Builder<T> {
         }
         self
     }
-    pub fn build(self, inner: T) -> io::Result<File<T>> {
+    pub fn build(self, inner: T) -> io::Result<IoStream<T>> {
         self.build_with_mode(Mode::default(), inner)
     }
-    pub fn build_with_mode(self, mode: Mode, inner: T) -> io::Result<File<T>> {
+    pub fn build_with_mode(self, mode: Mode, inner: T) -> io::Result<IoStream<T>> {
         let Self { vtable } = self;
         let cookie = Box::new(Cookie {
             vtable,
@@ -157,48 +157,51 @@ impl<T> Builder<T> {
             )
         };
         match NonNull::new(file.cast::<libc::FILE>()) {
-            Some(raw) => Ok(File {
-                stream: unsafe { OwnedCStream::from_raw_c_stream(raw) },
-                cookie,
-            }),
+            Some(raw) => {
+                // remove buffering.
+                unsafe { libc::setbuf(raw.as_ptr(), ptr::null_mut()) }
+                Ok(IoStream {
+                    stream: unsafe { OwnedCStream::from_raw_c_stream(raw) },
+                    cookie,
+                })
+            }
             None => Err(io::Error::last_os_error()),
         }
     }
 }
 
 #[derive(Debug)]
-pub struct File<T> {
+pub struct IoStream<T> {
     // this needs to be first so that it's dropped first
     stream: OwnedCStream,
     cookie: Box<Cookie<T>>,
 }
 
-impl<T> File<T> {
+impl<T> IoStream<T> {
     pub fn get_ref(&self) -> &T {
         &self.cookie.inner
     }
     pub fn get_mut(&mut self) -> &mut T {
         &mut self.cookie.inner
     }
-    /// Pointers returned from [`Self::stream`] are no longer valid.
     pub fn into_inner(self) -> T {
         self.cookie.inner
     }
 }
 
-impl<T> AsCStream for File<T> {
+impl<T> AsCStream for IoStream<T> {
     fn as_c_stream(&self) -> BorrowedCStream<'_> {
         self.stream.as_c_stream()
     }
 }
 
-impl<T> AsRawCStream for File<T> {
+impl<T> AsRawCStream for IoStream<T> {
     fn as_raw_c_stream(&self) -> cstream::RawCStream {
         self.stream.as_raw_c_stream()
     }
 }
 
-impl<T> IntoRawCStream for File<T> {
+impl<T> IntoRawCStream for IoStream<T> {
     /// Freeing the underlying `T` is deferred to [`libc::fclose`].
     fn into_raw_c_stream(self) -> cstream::RawCStream {
         let Self { stream, mut cookie } = self;
@@ -208,7 +211,7 @@ impl<T> IntoRawCStream for File<T> {
     }
 }
 
-impl<T: io::Write> io::Write for File<T> {
+impl<T: io::Write> io::Write for IoStream<T> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         self.cookie.inner.write(buf)
     }
@@ -217,20 +220,20 @@ impl<T: io::Write> io::Write for File<T> {
     }
 }
 
-impl<T: io::Read> io::Read for File<T> {
+impl<T: io::Read> io::Read for IoStream<T> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         self.cookie.inner.read(buf)
     }
 }
 
-impl<T: io::Seek> io::Seek for File<T> {
+impl<T: io::Seek> io::Seek for IoStream<T> {
     fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
         self.cookie.inner.seek(pos)
     }
 }
 
-unsafe impl<T: Send> Send for File<T> {}
-unsafe impl<T: Sync> Sync for File<T> {}
+unsafe impl<T: Send> Send for IoStream<T> {}
+unsafe impl<T: Sync> Sync for IoStream<T> {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct Cookie<T> {
@@ -555,8 +558,6 @@ fn set_errno(to: c_int) {
 
 #[cfg(test)]
 mod tests {
-    use std::ptr;
-
     use super::*;
 
     const TEST_TEXT: &str = "hello, world!";
@@ -566,9 +567,7 @@ mod tests {
         let mut v = vec![];
         let file = Builder::new().write().build(&mut v).unwrap();
 
-        assert_eq!(cstream::write(TEST_TEXT.as_bytes(), &file), TEST_TEXT.len());
-        drop(file);
-
+        assert_eq!(cstream::write(TEST_TEXT.as_bytes(), file), TEST_TEXT.len());
         assert_eq!(v, TEST_TEXT.as_bytes());
     }
 
@@ -580,9 +579,7 @@ mod tests {
             .build(Box::new(&mut v))
             .unwrap();
 
-        assert_eq!(cstream::write(TEST_TEXT.as_bytes(), &file), TEST_TEXT.len());
-        drop(file);
-
+        assert_eq!(cstream::write(TEST_TEXT.as_bytes(), file), TEST_TEXT.len());
         assert_eq!(v, TEST_TEXT.as_bytes());
     }
 
