@@ -79,11 +79,13 @@ impl IntoRawCStream for OwnedCStream {
     }
 }
 
+/// An [`OwnedCStream`] with a custom buffer.
 #[cfg(feature = "alloc")]
 #[cfg_attr(do_doc_cfg, doc(cfg(feature = "alloc")))]
 #[derive(Debug)]
 pub struct BufferedCStream {
     stream: OwnedCStream,
+    // this must be last so that it's dropped after flushing
     #[allow(unused)]
     buffer: alloc::boxed::Box<[u8]>,
 }
