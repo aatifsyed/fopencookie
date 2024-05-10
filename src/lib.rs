@@ -36,20 +36,21 @@
 //! ```
 
 use core::fmt;
+use cstream::{
+    AsCStream, AsRawCStream, BorrowedCStream, FromRawCStream, IntoRawCStream, OwnedCStream,
+};
+use fopencookie_sys as sys;
+use libc::{c_char, c_int, c_long, c_void, off_t, size_t};
 use std::{
     ffi::CStr,
     fmt::Write,
     io::{self, SeekFrom},
-    marker::PhantomPinned,
     mem,
     num::TryFromIntError,
     ptr::NonNull,
     slice,
     str::FromStr,
 };
-
-use fopencookie_sys as sys;
-use libc::{c_char, c_int, c_long, c_void, off_t, size_t};
 
 type ReadFnPtr<T = ()> = fn(&mut T, &mut [u8]) -> io::Result<usize>;
 type WriteFnPtr<T = ()> = fn(&mut T, &[u8]) -> io::Result<usize>;
@@ -156,48 +157,23 @@ impl<T> Builder<T> {
             )
         };
         match NonNull::new(file.cast::<libc::FILE>()) {
-            Some(ptr) => Ok(File {
+            Some(raw) => Ok(File {
+                stream: unsafe { OwnedCStream::from_raw_c_stream(raw) },
                 cookie,
-                stream: FCloseOnDrop { ptr },
-                _do_not_move: PhantomPinned,
             }),
             None => Err(io::Error::last_os_error()),
         }
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-struct FCloseOnDrop {
-    ptr: NonNull<libc::FILE>,
-}
-
-impl Drop for FCloseOnDrop {
-    fn drop(&mut self) {
-        let e = io::Error::last_os_error();
-        let message = match unsafe { libc::fclose(self.ptr.as_ptr()) } {
-            0 => None,
-            libc::EOF => Some(&e as &dyn fmt::Display),
-            _ => Some(&"undocumented return code from `fclose`" as &dyn fmt::Display),
-        };
-        if let Some(it) = message {
-            eprintln!("error closing FILE {}", it)
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug)]
 pub struct File<T> {
     // this needs to be first so that it's dropped first
-    stream: FCloseOnDrop,
+    stream: OwnedCStream,
     cookie: Box<Cookie<T>>,
-    _do_not_move: PhantomPinned,
 }
 
 impl<T> File<T> {
-    /// You must not call [`libc::fclose`] on the returned pointer.
-    pub fn stream(&self) -> &NonNull<libc::FILE> {
-        &self.stream.ptr
-    }
     pub fn get_ref(&self) -> &T {
         &self.cookie.inner
     }
@@ -208,21 +184,27 @@ impl<T> File<T> {
     pub fn into_inner(self) -> T {
         self.cookie.inner
     }
-    /// Freeing the underlying io is deferred to [`libc::fclose`].
-    pub fn into_stream(self) -> NonNull<libc::FILE>
-    where
-        T: 'static,
-    {
-        let Self {
-            stream,
-            mut cookie,
-            _do_not_move,
-        } = self;
+}
+
+impl<T> AsCStream for File<T> {
+    fn as_c_stream(&self) -> BorrowedCStream<'_> {
+        self.stream.as_c_stream()
+    }
+}
+
+impl<T> AsRawCStream for File<T> {
+    fn as_raw_c_stream(&self) -> cstream::RawCStream {
+        self.stream.as_raw_c_stream()
+    }
+}
+
+impl<T> IntoRawCStream for File<T> {
+    /// Freeing the underlying `T` is deferred to [`libc::fclose`].
+    fn into_raw_c_stream(self) -> cstream::RawCStream {
+        let Self { stream, mut cookie } = self;
         cookie.drop_on_close = true;
         mem::forget(cookie);
-        let ptr = stream.ptr;
-        mem::forget(stream);
-        ptr
+        stream.into_raw_c_stream()
     }
 }
 
@@ -577,24 +559,17 @@ mod tests {
 
     use super::*;
 
-    const TEST_TEXT: &CStr = c"hello, world!";
-    const TEST_TEXT_LEN: i32 = TEST_TEXT.to_bytes().len() as _;
+    const TEST_TEXT: &str = "hello, world!";
 
     #[test]
     fn borrowed() {
         let mut v = vec![];
-        let file = Builder::new()
-            .write()
-            .build_with_mode(Mode::WritePlus, &mut v)
-            .unwrap();
-        unsafe {
-            assert_eq!(
-                libc::fprintf(file.stream().as_ptr(), TEST_TEXT.as_ptr()),
-                TEST_TEXT_LEN
-            );
-            assert_eq!(libc::fclose(file.stream().as_ptr()), 0);
-        };
-        assert_eq!(v, TEST_TEXT.to_bytes());
+        let file = Builder::new().write().build(&mut v).unwrap();
+
+        assert_eq!(cstream::write(TEST_TEXT.as_bytes(), &file), TEST_TEXT.len());
+        drop(file);
+
+        assert_eq!(v, TEST_TEXT.as_bytes());
     }
 
     #[test]
@@ -602,17 +577,13 @@ mod tests {
         let mut v = vec![];
         let file = Builder::<Box<dyn io::Write>>::new()
             .write()
-            .build_with_mode(Mode::WritePlus, Box::new(&mut v))
+            .build(Box::new(&mut v))
             .unwrap();
-        unsafe {
-            assert_eq!(
-                libc::fprintf(file.stream().as_ptr(), TEST_TEXT.as_ptr()),
-                TEST_TEXT_LEN
-            );
-            assert_eq!(libc::fclose(file.stream().as_ptr()), 0);
-        };
+
+        assert_eq!(cstream::write(TEST_TEXT.as_bytes(), &file), TEST_TEXT.len());
         drop(file);
-        assert_eq!(v, TEST_TEXT.to_bytes());
+
+        assert_eq!(v, TEST_TEXT.as_bytes());
     }
 
     #[test]
@@ -663,46 +634,7 @@ mod tests {
         }
     }
 
-    #[test]
-    fn fail_to_open() {
-        #[derive(Debug)]
-        struct Dummy;
-        impl io::Seek for Dummy {
-            fn seek(&mut self, _: SeekFrom) -> io::Result<u64> {
-                Err(io::Error::other("seek"))
-            }
-        }
-        impl io::Write for Dummy {
-            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
-                Err(io::Error::other("write"))
-            }
-
-            fn flush(&mut self) -> io::Result<()> {
-                Err(io::Error::other("flush"))
-            }
-        }
-        impl io::Read for Dummy {
-            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
-                Err(io::Error::other("read"))
-            }
-        }
-        for mode in [
-            Mode::Append,
-            Mode::AppendPlus,
-            Mode::Read,
-            Mode::ReadPlus,
-            Mode::Write,
-            Mode::WritePlus,
-        ] {
-            let res = Builder::new()
-                .read()
-                .write()
-                .seek()
-                .build_with_mode(mode, Dummy);
-            let _ = dbg!(res);
-        }
-    }
-
+    /// Cookie functions which always return the error state.
     mod noop_err {
         use libc::{c_char, c_int, c_long, c_void, off_t, size_t};
 

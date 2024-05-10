@@ -1,10 +1,20 @@
-//! Owned and borrowed [`libc::FILE`] streams.
-//!
-//! This library's design largely mirrors that of [`std::os::fd`](https://doc.rust-lang.org/std/os/fd/index.html).
+//! - Owned and borrowed [`libc::FILE`] streams.
+//!   Mirroring [`std::os::fd`](https://doc.rust-lang.org/std/os/fd/index.html)'s API.
+//! - Rusty wrappers around [`libc`]'s stream-oriented functions
 
-#![no_std]
+#![cfg_attr(not(feature = "std"), no_std)]
+#[cfg(feature = "alloc")]
+extern crate alloc;
 
-use core::{marker::PhantomData, mem, ptr::NonNull};
+use core::{
+    ffi::CStr,
+    fmt,
+    marker::PhantomData,
+    mem,
+    ptr::{self, NonNull},
+};
+
+use libc::{c_char, c_int, c_void};
 
 /// A [`libc::FILE`] stream.
 pub type RawCStream = NonNull<libc::FILE>;
@@ -89,11 +99,57 @@ impl<'a> BorrowedCStream<'a> {
     }
 }
 
+impl AsCStream for BorrowedCStream<'_> {
+    fn as_c_stream(&self) -> BorrowedCStream<'_> {
+        *self
+    }
+}
+
+impl AsRawCStream for BorrowedCStream<'_> {
+    fn as_raw_c_stream(&self) -> RawCStream {
+        self.raw
+    }
+}
+
+macro_rules! pointer_impls {
+    ($trait:ident, $method:ident, $return:ty) => {
+        impl<T: $trait + ?Sized> $trait for &T {
+            fn $method(&self) -> $return {
+                T::$method(self)
+            }
+        }
+        impl<T: $trait + ?Sized> $trait for &mut T {
+            fn $method(&self) -> $return {
+                T::$method(self)
+            }
+        }
+        #[cfg(feature = "alloc")]
+        impl<T: $trait + ?Sized> $trait for alloc::boxed::Box<T> {
+            fn $method(&self) -> $return {
+                T::$method(self)
+            }
+        }
+        #[cfg(feature = "alloc")]
+        impl<T: $trait + ?Sized> $trait for alloc::rc::Rc<T> {
+            fn $method(&self) -> $return {
+                T::$method(self)
+            }
+        }
+        #[cfg(feature = "alloc")]
+        impl<T: $trait + ?Sized> $trait for alloc::sync::Arc<T> {
+            fn $method(&self) -> $return {
+                T::$method(self)
+            }
+        }
+    };
+}
+
 /// A trait to borrow a stream from an underlying object.
 pub trait AsCStream {
     /// Borrows the stream.
     fn as_c_stream(&self) -> BorrowedCStream<'_>;
 }
+pointer_impls!(AsCStream, as_c_stream, BorrowedCStream<'_>);
 
 /// A trait to extract the raw stream from an underlying object.
 pub trait AsRawCStream {
@@ -108,6 +164,7 @@ pub trait AsRawCStream {
     /// See [`AsCStream::as_c_stream`] for an API which strictly borrows a stream.
     fn as_raw_c_stream(&self) -> RawCStream;
 }
+pointer_impls!(AsRawCStream, as_raw_c_stream, RawCStream);
 
 /// A trait to express the ability to construct an object from a raw stream.
 pub trait FromRawCStream {
@@ -121,6 +178,12 @@ pub trait FromRawCStream {
     /// - The stream passed in must be an [owned stream](https://doc.rust-lang.org/std/io/index.html#io-safety); in particular, it must be open.
     unsafe fn from_raw_c_stream(raw: RawCStream) -> Self;
 }
+impl FromRawCStream for RawCStream {
+    unsafe fn from_raw_c_stream(raw: RawCStream) -> Self {
+        raw
+    }
+}
+
 /// A trait to express the ability to consume an object and acquire ownership of its raw stream.
 pub trait IntoRawCStream {
     /// Consumes this object, returning the raw underlying stream.
@@ -129,4 +192,206 @@ pub trait IntoRawCStream {
     /// When used in this way,
     /// callers are then the unique owners of the file descriptor and must close it once it’s no longer needed.
     fn into_raw_c_stream(self) -> RawCStream;
+}
+
+impl IntoRawCStream for RawCStream {
+    fn into_raw_c_stream(self) -> RawCStream {
+        self
+    }
+}
+
+//////////////////////
+// Operations on files
+//////////////////////
+
+pub fn tmpfile() -> Option<OwnedCStream> {
+    let raw = NonNull::new(unsafe { libc::tmpfile() })?;
+    Some(unsafe { OwnedCStream::from_raw_c_stream(raw) })
+}
+
+//////////////
+// File access
+//////////////
+
+fn ptr<T: AsCStream>(stream: T) -> *mut libc::FILE {
+    stream.as_c_stream().as_raw_c_stream().as_ptr()
+}
+
+#[allow(clippy::result_unit_err)]
+pub fn flush<T: AsCStream>(stream: T) -> Result<(), ()> {
+    let ret = unsafe { libc::fflush(ptr(stream)) };
+    match ret {
+        0 => Ok(()),
+        libc::EOF => Err(()),
+        _undocumented => Err(()),
+    }
+}
+
+pub fn open(filename: &CStr, mode: &CStr) -> Option<OwnedCStream> {
+    let raw = NonNull::new(unsafe { libc::fopen(filename.as_ptr(), mode.as_ptr()) })?;
+    Some(unsafe { OwnedCStream::from_raw_c_stream(raw) })
+}
+
+#[cfg(feature = "std")]
+pub fn fdopen<T: std::os::fd::IntoRawFd>(fd: T, mode: &CStr) -> Option<OwnedCStream> {
+    let fd = fd.into_raw_fd();
+    let raw = NonNull::new(unsafe { libc::fdopen(fd, mode.as_ptr()) })?;
+    Some(unsafe { OwnedCStream::from_raw_c_stream(raw) })
+}
+
+pub fn reopen(filename: Option<&CStr>, mode: &CStr, stream: OwnedCStream) -> Option<OwnedCStream> {
+    let raw = NonNull::new(unsafe {
+        libc::freopen(
+            filename.map(CStr::as_ptr).unwrap_or_else(ptr::null),
+            mode.as_ptr(),
+            stream.into_raw_c_stream().as_ptr(),
+        )
+    })?;
+    Some(unsafe { OwnedCStream::from_raw_c_stream(raw) })
+}
+
+pub fn fileno<T: AsCStream>(stream: T) -> Option<c_int> {
+    match unsafe { libc::fileno(ptr(stream)) } {
+        -1 => None,
+        other => Some(other),
+    }
+}
+
+/////////////////////////
+// Character input/output
+/////////////////////////
+pub fn getc<T: AsCStream>(stream: T) -> Option<u8> {
+    match unsafe { libc::fgetc(ptr(stream)) } {
+        libc::EOF => None,
+        it => Some(it as u8),
+    }
+}
+
+#[allow(clippy::result_unit_err)]
+pub fn ungetc<T: AsCStream>(char: u8, stream: T) -> Result<(), ()> {
+    match unsafe { libc::ungetc(char as c_int, ptr(stream)) } {
+        libc::EOF => Err(()),
+        _ => Ok(()),
+    }
+}
+
+pub fn gets<T: AsCStream>(buf: &mut [u8], stream: T) -> Option<&CStr> {
+    match unsafe {
+        libc::fgets(
+            buf.as_mut_ptr().cast::<c_char>(),
+            buf.len().try_into().ok()?,
+            ptr(stream),
+        )
+    }
+    .is_null()
+    {
+        true => None,
+        false => CStr::from_bytes_until_nul(buf).ok(),
+    }
+}
+
+#[allow(clippy::result_unit_err, clippy::if_same_then_else)]
+pub fn putc<T: AsCStream>(char: u8, stream: T) -> Result<(), ()> {
+    let ret = unsafe { libc::fputc(char as c_int, ptr(stream)) };
+    if ret == libc::EOF {
+        Err(())
+    } else {
+        Ok(())
+    }
+}
+
+#[allow(clippy::result_unit_err)]
+pub fn puts<T: AsCStream>(s: &CStr, stream: T) -> Result<(), ()> {
+    let ret = unsafe { libc::fputs(s.as_ptr(), ptr(stream)) };
+    if ret == libc::EOF {
+        Err(())
+    } else if ret > 0 {
+        Ok(())
+    } else {
+        Err(()) // undocumented
+    }
+}
+
+//////////////////////
+// Direct input/output
+//////////////////////
+
+pub fn read<T: AsCStream>(buf: &mut [u8], stream: T) -> usize {
+    unsafe { libc::fread(buf.as_mut_ptr().cast::<c_void>(), 1, buf.len(), ptr(stream)) }
+}
+
+pub fn write<T: AsCStream>(buf: &[u8], stream: T) -> usize {
+    unsafe { libc::fwrite(buf.as_ptr().cast::<c_void>(), 1, buf.len(), ptr(stream)) }
+}
+///////////////////
+// File positioning
+///////////////////
+#[cfg(feature = "std")]
+#[allow(clippy::result_unit_err)]
+pub fn seek<T: AsCStream>(stream: T, pos: std::io::SeekFrom) -> Result<(), ()> {
+    let (offset, whence) = match pos {
+        std::io::SeekFrom::Start(it) => (it.try_into().map_err(|_| ())?, libc::SEEK_SET),
+        std::io::SeekFrom::End(it) => (it, libc::SEEK_END),
+        std::io::SeekFrom::Current(it) => (it, libc::SEEK_CUR),
+    };
+    match unsafe { libc::fseek(ptr(stream), offset, whence) } {
+        0 => Ok(()),
+        -1 => Err(()),
+        _undocumented => Err(()),
+    }
+}
+
+pub fn tell<T: AsCStream>(stream: T) -> Option<u64> {
+    unsafe { libc::ftell(ptr(stream)) }.try_into().ok()
+}
+
+pub fn rewind<T: AsCStream>(stream: T) {
+    unsafe { libc::rewind(ptr(stream)) }
+}
+
+/////////////////
+// Error-handling
+/////////////////
+
+pub fn eof<T: AsCStream>(stream: T) -> bool {
+    unsafe { libc::feof(ptr(stream)) != 0 }
+}
+
+pub fn clear_errors<T: AsCStream>(stream: T) {
+    unsafe { libc::clearerr(ptr(stream)) }
+}
+
+/// A capture of the error indicator on a [`RawCStream`].
+#[derive(Debug, Clone)]
+pub struct FError(pub i32);
+
+impl FError {
+    pub fn of<T: AsCStream>(stream: T) -> Self {
+        Self(unsafe { libc::ferror(ptr(stream)) })
+    }
+}
+
+impl fmt::Display for FError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_fmt(format_args!("error indicator {} was set on stream", self.0))
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for FError {}
+
+#[cfg(all(test, feature = "std"))]
+mod tests {
+    use super::*;
+    use std::{ffi::CString, fs, os::unix::ffi::OsStrExt as _};
+    use tempfile::NamedTempFile;
+
+    #[test]
+    fn test_write() {
+        let named = NamedTempFile::new().unwrap();
+        let path = CString::new(named.path().as_os_str().as_bytes()).unwrap();
+        let stream = open(&path, c"rw+").unwrap();
+        assert_eq!(write(b"hello, world!", stream), 13);
+        assert_eq!(fs::read_to_string(named.path()).unwrap(), "hello, world!");
+    }
 }

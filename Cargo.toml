@@ -4,10 +4,11 @@ version = "0.1.0"
 edition = "2021"
 
 [workspace]
-members = [ "cstream","sys"]
+members = ["cstream", "sys"]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+cstream = { version = "0.1.0", path = "cstream" }
 fopencookie-sys = { version = "0.1.0", path = "sys" }
 libc = "0.2.154"
