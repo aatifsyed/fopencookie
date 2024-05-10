@@ -1,6 +1,6 @@
 [package]
 name = "fopencookie"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "interface between std::io and libc::FILE"
 categories = ["external-ffi-bindings", "filesystem", "os", "api-bindings"]
@@ -14,6 +14,6 @@ repository = "https://github.com/aatifsyed/fopencookie"
 members = ["cstream", "sys"]
 
 [dependencies]
-cstream = { version = "0.1.0", path = "cstream" }
-fopencookie-sys = { version = "0.1.0", path = "sys" }
+cstream = { version = "0.1.1", path = "cstream" }
+fopencookie-sys = { version = "0.1.1", path = "sys" }
 libc = "0.2.154"

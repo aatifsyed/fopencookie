@@ -74,7 +74,7 @@ dependencies = [
 
 [[package]]
 name = "cstream"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "libc",
  "tempfile",
@@ -104,7 +104,7 @@ checksum = "9fc0510504f03c51ada170672ac806f1f105a88aa97a5281117e1ddc3368e51a"
 
 [[package]]
 name = "fopencookie"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "cstream",
  "fopencookie-sys",
@@ -113,7 +113,7 @@ dependencies = [
 
 [[package]]
 name = "fopencookie-sys"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bindgen",
  "cc",
