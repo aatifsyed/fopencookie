@@ -106,7 +106,7 @@ impl BufferedCStream {
                 buffer.as_mut_ptr().cast::<c_char>(),
                 match mode {
                     BufferMode::Block => libc::_IOFBF,
-                    BufferMode::Line => libc::_IONBF,
+                    BufferMode::Line => libc::_IOLBF,
                 },
                 buffer.len(),
             )
