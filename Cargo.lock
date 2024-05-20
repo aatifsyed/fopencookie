@@ -74,7 +74,7 @@ dependencies = [
 
 [[package]]
 name = "cstream"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "libc",
  "tempfile",
